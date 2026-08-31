@@ -1145,6 +1145,8 @@ class KVCacheTensor:
     layer_stride: int
     block_stride: int
     offset: int = 0  # byte offset of layers[0]'s block 0
+    pool_id: int = 0  # independent backing allocation (0 unless multi-pool)
+    num_blocks: int | None = None  # B dimension; None uses KVCacheConfig.num_blocks
 
 
 @dataclass
@@ -1160,6 +1162,8 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Which BlockPool / backing allocation this group draws block IDs from.
+    cache_pool_id: int = 0
 
 
 @dataclass
@@ -1169,7 +1173,12 @@ class KVCacheConfig:
     """
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks.
+
+    With a single shared pool this is the pool size. With independent pools
+    (``pool_num_blocks`` set) this is the first pool's size, kept for
+    callers that still read a single count.
+    """
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
@@ -1184,6 +1193,15 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    pool_num_blocks: tuple[int, ...] | None = None
+    """Per-pool block counts when groups do not share one BlockPool.
+
+    ``None`` means a single pool of ``num_blocks``. Independent GLM-5.3
+    target/recurrent pools set this to ``(n_target, n_recurrent)``.
+    """
+    pool_bytes_per_block: tuple[int, ...] | None = None
+    """Physical stride of each pool in ``pool_num_blocks``. ``None`` when
+    there is a single shared pool."""
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -1215,3 +1233,34 @@ class KVCacheConfig:
         bytes to NaN/Inf. Uniform-precision caches skip zeroing.
         """
         return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+
+    @property
+    def num_cache_pools(self) -> int:
+        if self.pool_num_blocks is None:
+            return 1
+        return len(self.pool_num_blocks)
+
+    def num_blocks_for_pool(self, pool_id: int) -> int:
+        if self.pool_num_blocks is None:
+            return self.num_blocks
+        return self.pool_num_blocks[pool_id]
+
+    def bytes_per_block_for_pool(self, pool_id: int) -> int:
+        if self.pool_bytes_per_block is None:
+            if not self.kv_cache_tensors:
+                return 1
+            num_blocks = max(self.num_blocks, 1)
+            return self.kv_cache_tensors[0].size // num_blocks
+        return self.pool_bytes_per_block[pool_id]
+
+    def mamba_pool_num_blocks(self) -> int:
+        """Block count of the recurrent-state pool, else ``num_blocks``."""
+        if self.pool_num_blocks is None:
+            return self.num_blocks
+        for group in self.kv_cache_groups:
+            if any(
+                isinstance(spec, MambaSpec)
+                for spec in iter_layer_specs(group.kv_cache_spec)
+            ):
+                return self.pool_num_blocks[group.cache_pool_id]
+        return self.num_blocks

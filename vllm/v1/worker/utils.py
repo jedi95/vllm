@@ -386,13 +386,24 @@ def allocate_kv_cache(
     Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of
     block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache
     groups overlay each other, so tensors may address the same bytes.
+    Independent cache pools (for example GLM-5.3 target vs recurrent) each
+    get their own backing allocation and block-ID space.
     """
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
-    sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
-    assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
-    buf = torch.zeros(sizes.pop(), dtype=torch.int8, device=device)
+    pool_bufs: dict[int, torch.Tensor] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        if tensor.pool_id not in pool_bufs:
+            pool_bufs[tensor.pool_id] = torch.zeros(
+                tensor.size, dtype=torch.int8, device=device
+            )
+        else:
+            assert pool_bufs[tensor.pool_id].numel() == tensor.size, (
+                "KV cache tensors in the same pool must share one backing "
+                f"allocation; pool {tensor.pool_id} has size "
+                f"{pool_bufs[tensor.pool_id].numel()} and {tensor.size}."
+            )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
@@ -406,13 +417,17 @@ def allocate_kv_cache(
         if isinstance(spec, UniformTypeKVCacheSpecs):
             spec = spec.kv_cache_specs[layer_name]
 
-        num_blocks = kv_cache_config.num_blocks
+        num_blocks = (
+            tensor.num_blocks
+            if tensor.num_blocks is not None
+            else kv_cache_config.num_blocks
+        )
         kernel_block_size = None
         if kernel_block_sizes is not None and group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[group_id]
 
         views = create_kv_cache_views(
-            buf,
+            pool_bufs[tensor.pool_id],
             spec,
             num_blocks,
             layout,

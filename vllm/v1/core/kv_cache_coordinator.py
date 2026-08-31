@@ -95,13 +95,22 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
-        self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
-            enable_caching=enable_caching,
-            hash_block_size=hash_block_size,
-            enable_kv_cache_events=enable_kv_cache_events,
-            metrics_collector=metrics_collector,
+        if kv_cache_config.pool_num_blocks is None:
+            pool_sizes = (kv_cache_config.num_blocks,)
+        else:
+            pool_sizes = kv_cache_config.pool_num_blocks
+        self.block_pools = tuple(
+            BlockPool(
+                num_gpu_blocks=num_gpu_blocks,
+                enable_caching=enable_caching,
+                hash_block_size=hash_block_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+                metrics_collector=metrics_collector,
+            )
+            for num_gpu_blocks in pool_sizes
         )
+        # Single-pool callers (usage, events, tests) still read ``block_pool``.
+        self.block_pool = self.block_pools[0]
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -138,7 +147,7 @@ class KVCacheCoordinator(ABC):
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
                 max_in_flight_tokens=max_in_flight_tokens,
                 max_model_len=max_model_len,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[kv_cache_group.cache_pool_id],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -193,12 +202,36 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_per_pool(
+                request_id,
+                num_tokens,
+                new_computed_blocks,
+                num_encoder_tokens,
+                total_computed_tokens,
+                num_local_computed_tokens,
+                num_tokens_main_model,
+                apply_admission_cap,
+            )
+        )
+
+    def get_num_blocks_to_allocate_per_pool(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_local_computed_tokens: int,
+        num_tokens_main_model: int,
+        apply_admission_cap: bool = False,
+    ) -> list[int]:
+        """Blocks needed from each cache pool, in pool-id order."""
+        needed = [0] * len(self.block_pools)
         for i, manager in enumerate(self.single_type_managers):
+            pool_id = self.kv_cache_config.kv_cache_groups[i].cache_pool_id
             if isinstance(manager, CrossAttentionManager):
-                # For cross-attention, we issue a single static allocation
-                # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                needed[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_encoder_tokens,
                     [],
@@ -208,7 +241,7 @@ class KVCacheCoordinator(ABC):
                     apply_admission_cap=apply_admission_cap,
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                needed[pool_id] += manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
@@ -217,7 +250,36 @@ class KVCacheCoordinator(ABC):
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
                 )
-        return num_blocks_to_allocate
+        return needed
+
+    def block_pool_for_group(self, group_id: int) -> BlockPool:
+        pool_id = self.kv_cache_config.kv_cache_groups[group_id].cache_pool_id
+        return self.block_pools[pool_id]
+
+    def get_num_free_blocks_per_pool(self) -> list[int]:
+        return [pool.get_num_free_blocks() for pool in self.block_pools]
+
+    def get_usage(self) -> float:
+        """Byte-weighted used fraction across cache pools."""
+        total = 0
+        free = 0
+        for pool_id, pool in enumerate(self.block_pools):
+            stride = self.kv_cache_config.bytes_per_block_for_pool(pool_id)
+            usable = max(pool.num_gpu_blocks - 1, 0)
+            total += usable * stride
+            free += pool.get_num_free_blocks() * stride
+        if not total:
+            return 0.0
+        return 1.0 - (free / total)
+
+    def reset_prefix_cache(self) -> bool:
+        return all(pool.reset_prefix_cache() for pool in self.block_pools)
+
+    def take_events(self) -> list:
+        events = []
+        for pool in self.block_pools:
+            events.extend(pool.take_events())
+        return events
 
     def allocate_new_computed_blocks(
         self,
@@ -839,7 +901,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     block_hashes=block_hashes,
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
-                    block_pool=self.block_pool,
+                    block_pool=self.single_type_managers[first_group_id].block_pool,
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self._cache_hit_alignment_tokens,
@@ -908,7 +970,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 block_hashes=block_hashes,
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
-                block_pool=self.block_pool,
+                block_pool=self.single_type_managers[group_ids[0]].block_pool,
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self._cache_hit_alignment_tokens,

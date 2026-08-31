@@ -2288,10 +2288,7 @@ def test_group_dcp_replicated_dflash_with_hybrid_mla_target():
     assert groups[-1].kv_cache_spec.dcp_replicated is True
 
 
-def test_glm5next_split_cache_preserves_physical_pages(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Split GLM-5.3 cache groups retain their independent page geometry."""
+def _glm5next_split_specs() -> tuple[MLAAttentionSpec, MambaSpec]:
     target = MLAAttentionSpec(
         block_size=512,
         num_kv_heads=1,
@@ -2309,7 +2306,14 @@ def test_glm5next_split_cache_preserves_physical_pages(
     )
     assert target.page_size_bytes == 287232
     assert recurrent.page_size_bytes == 1171456
+    return target, recurrent
 
+
+def test_glm5next_split_cache_preserves_physical_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Split GLM-5.3 cache groups retain their independent page geometry."""
+    target, recurrent = _glm5next_split_specs()
     monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
     groups = get_kv_cache_groups(
         _grouping_config(),
@@ -2326,15 +2330,118 @@ def test_glm5next_split_cache_preserves_physical_pages(
         "model.recurrent": recurrent.page_size_bytes,
     }
 
-    c4_index_page_bytes = 64 * 132
-    expected_pool_stride = (
-        (recurrent.page_size_bytes + c4_index_page_bytes - 1)
-        // c4_index_page_bytes
-        * c4_index_page_bytes
+
+def test_glm5next_split_uses_independent_pools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Target and recurrent pages get separate block pools and backing buffers."""
+    target, recurrent = _glm5next_split_specs()
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {"model.target": target, "model.recurrent": recurrent},
     )
-    assert kv_cache_utils._get_kv_cache_bytes_per_block(groups) == (
-        expected_pool_stride
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=2048))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    available = 64 * recurrent.page_size_bytes
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, available
     )
+
+    assert config.pool_num_blocks is not None
+    assert len(config.pool_num_blocks) == 2
+    assert config.pool_bytes_per_block == (
+        target.page_size_bytes,
+        recurrent.page_size_bytes,
+    )
+    assert {tensor.pool_id for tensor in config.kv_cache_tensors} == {0, 1}
+    target_tensor = next(t for t in config.kv_cache_tensors if t.pool_id == 0)
+    recurrent_tensor = next(t for t in config.kv_cache_tensors if t.pool_id == 1)
+    assert target_tensor.size == (config.pool_num_blocks[0] * target.page_size_bytes)
+    assert recurrent_tensor.size == (
+        config.pool_num_blocks[1] * recurrent.page_size_bytes
+    )
+    assert target_tensor.size + recurrent_tensor.size <= available + max(
+        target.page_size_bytes, recurrent.page_size_bytes
+    )
+
+    overlay_stride = recurrent.page_size_bytes
+    overlay_blocks = available // overlay_stride
+    overlay_blocks_per_request = sum(
+        kv_cache_utils._group_blocks_per_request(vllm_config, group) for group in groups
+    )
+    overlay_concurrency = overlay_blocks / overlay_blocks_per_request
+    split_concurrency = get_max_concurrency_for_kv_cache_config(vllm_config, config)
+    assert split_concurrency > overlay_concurrency * 1.2
+
+
+def test_glm5next_split_allocate_uses_two_backing_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, recurrent = _glm5next_split_specs()
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {"model.target": target, "model.recurrent": recurrent},
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=2048))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, 64 * recurrent.page_size_bytes
+    )
+    from vllm.v1.kv_cache_interface import KVCacheLayout
+    from vllm.v1.worker.utils import allocate_kv_cache
+
+    caches = allocate_kv_cache(config, torch.device("cpu"), KVCacheLayout.BLHNC, None)
+    assert (
+        caches["model.target"].untyped_storage().data_ptr()
+        != caches["model.recurrent"].untyped_storage().data_ptr()
+    )
+    assert caches["model.target"].shape[0] == config.pool_num_blocks[0]
+    assert caches["model.recurrent"].shape[0] == config.pool_num_blocks[1]
+
+
+def test_glm5next_split_manager_allocates_from_both_pools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target, recurrent = _glm5next_split_specs()
+    monkeypatch.setenv("VLLM_GLM53_SPLIT_TARGET_BLOCK_SIZE", "512")
+    groups = get_kv_cache_groups(
+        _grouping_config(),
+        {"model.target": target, "model.recurrent": recurrent},
+    )
+    vllm_config = VllmConfig(model_config=ModelConfig(max_model_len=2048))
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config, groups, 64 * recurrent.page_size_bytes
+    )
+    sched_config = generate_scheduler_kv_cache_config([config])
+    manager = KVCacheManager(
+        kv_cache_config=sched_config,
+        max_model_len=2048,
+        scheduler_block_size=512,
+        hash_block_size=512,
+        enable_caching=False,
+    )
+    assert len(manager.coordinator.block_pools) == 2
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=[],
+        block_size=512,
+        mm_positions=None,
+        mm_hashes=None,
+    )
+    blocks = manager.allocate_slots(request, num_new_tokens=512)
+    assert blocks is not None
+    block_ids = blocks.get_block_ids()
+    assert len(block_ids) == 2
+    assert len(block_ids[0]) >= 1
+    assert len(block_ids[1]) >= 1
+    # Independent ID spaces: both pools may issue block 1.
+    assert manager.coordinator.block_pools[0] is not manager.coordinator.block_pools[1]
 
 
 def new_indexer_mla_spec(block_size=16):
